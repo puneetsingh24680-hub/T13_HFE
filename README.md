@@ -91,9 +91,6 @@ assignment.
 | [Puneet Singh](#puneet-singh) | [puneetsingh24680-hub](https://github.com/puneetsingh24680-hub) | Dilemmas, run journal, evaluation runner, LLM recordings, final integration | 12 |
 | [Rohan Hasharth Amathaluri](#rohan-hasharth-amathaluri) | [Rohanharsh163](https://github.com/Rohanharsh163) | FastAPI app, frontend for both labs, UI tests, presentation | 13 |
 
-† Uploaded to this repository by Puneet Singh on 18 November 2026 because the file was missing.
-‡ Uploaded to this repository by Debanshu Ghosh.
-
 ### Debanshu Ghosh
 
 - **Decision agents:** the four decision models (expected utility, Sen-inspired welfare, Simon's satisficing and prospect theory).
@@ -129,17 +126,17 @@ assignment.
 |---|---|
 | `ethics_lab/scenarios.py` | Authored pilot cases for the Before You Decide lab |
 | `ethics_lab/decision/human.py` | Human-preference benchmark from the Moral Machine experiment |
-| `results/decision_lab.json` † | Decision Lab evaluation results as data |
-| `tests/test_api.py` † | Tests for the main API |
-| `tests/browser_smoke.py` † | End-to-end browser check |
+| `results/decision_lab.json` | Decision Lab evaluation results as data |
+| `tests/test_api.py` | Tests for the main API |
+| `tests/browser_smoke.py` | End-to-end browser check |
 | `docs/architecture.md` | System architecture |
-| `docs/decision-lab.md` † | Decision Lab documentation |
-| `docs/report.md` † | Final report draft |
-| `docs/history/progress.md` † | Implementation record |
-| `docs/history/proposal-feedback.md` † | Proposal summary and teacher feedback |
-| `README.md` ‡ | Project overview |
-| `pytest.ini` † | Test configuration |
-| `start.ps1` † | Windows start script |
+| `docs/decision-lab.md` | Decision Lab documentation |
+| `docs/report.md` | Final report draft |
+| `docs/history/progress.md` | Implementation record |
+| `docs/history/proposal-feedback.md` | Proposal summary and teacher feedback |
+| `README.md` | Project overview |
+| `pytest.ini` | Test configuration |
+| `start.ps1` | Windows start script |
 
 ### Priyanshu
 
@@ -170,7 +167,7 @@ assignment.
 - **Run journal:** a local SQLite store with atomic edits and replayable events.
 - **Evaluation runner:** a script that regenerates all Decision Lab results offline, plus 8 recorded model runs for replay without an API key.
 - **Model comparison frontend:** the model selection, connection status, result cards and history, plus a read-only browser check of saved results.
-- **Final integration:** restored `ethics_lab/app.py`, corrected the import in `ethics_lab/comparisons.py`, and uploaded the files marked †.
+- **Final integration:** restored `ethics_lab/app.py`, corrected the import in `ethics_lab/comparisons.py`, and uploaded the missing project files.
 
 | File | Contribution |
 |---|---|
@@ -200,7 +197,7 @@ assignment.
 | `ethics_lab/app.py` | FastAPI application server |
 | `static/index.html` | Before You Decide page |
 | `static/app.js` | Before You Decide frontend logic |
-| `static/styles.css` † | Shared stylesheet |
+| `static/styles.css` | Shared stylesheet |
 | `static/decision.html` | Decision Lab page |
 | `static/decision.js` | Decision Lab frontend logic |
 | `static/decision.css` | Decision Lab styles |
