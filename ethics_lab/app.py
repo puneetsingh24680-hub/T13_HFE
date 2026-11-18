@@ -1,319 +1,250 @@
-"""Scoped-down reproduction of "Generative or Discriminative? Revisiting Text Classification in the
-Era of Transformers" (Kasa et al., EMNLP 2025), Paper #13.
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Literal
+from copy import deepcopy
+from uuid import uuid4
+import secrets
 
-What is reproduced (paper Q1/Q2/Q3, at small scale):
-  ENC        discriminative encoder + linear head, cross-entropy on P(y|x)
-  MLM        pseudo-generative: "... the label is [MASK]" read out over the label tokens
-  AR         generative causal LM, label PREPENDED, predict argmax_y log P(x | y)  (one pass per label)
-  AR_pseudo  causal LM, label APPENDED, one pass, read out over the label tokens
-NOT reproduced: DIFF (discrete-diffusion classifier) -- too expensive on CPU; see README for the scope note.
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, ConfigDict, Field
 
-All models are trained FROM SCRATCH (as in the paper), with the same tiny transformer backbone.
+from . import engine, store, comparisons, openrouter
+from .decision import api as decision_api, llm_api as decision_llm_api
+from .scenarios import ACTIONS, FACTS, FRAMEWORKS, SCENARIOS, VERSION, fact_cards, fact_value, get_scenario, fact_ids, facts_for, spent_credits
 
-Usage:
-  python repro.py --dataset agnews --layers 1 4 --sizes 128 512 2048 8192 --seeds 0 1 2
-Results are appended to results/<dataset>.jsonl (resumable: finished runs are skipped).
-Each row stores: wf1, acc, ece (1,000 test examples), wf1_500 (clean, first 500), drop30 and sub30 (same 500, noised).
-"""
-import argparse
-import csv
-import json
-import math
-import os
-import re
-import time
-from collections import Counter
-
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from sklearn.metrics import f1_score
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-MAXLEN = 40          # text tokens kept per example
-VOCAB = 3000         # word-level vocabulary built from the training pool
-D_MODEL, N_HEADS = 128, 4
-PAD, UNK, MASK, CLS, SEP, BOS = range(6)
-NSPECIAL = 6
-TOK = re.compile(r"\w+|[^\w\s]")
+app = FastAPI(title="Before You Decide", version=VERSION)
+STATIC = Path(__file__).resolve().parent.parent / "static"
+app.mount("/static", StaticFiles(directory=STATIC), name="static")
+app.include_router(decision_api.router)
+app.include_router(decision_llm_api.router)
 
 
-# ------------------------------------------------------------------------------------------- data
-def tokenize(s):
-    return TOK.findall(s.lower())
+class NewRun(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    scenario_id: str
 
 
-def load_dataset(name):
-    d = os.path.join(HERE, "data")
-    if name == "agnews":
-        def rd(f):
-            rows = list(csv.reader(open(os.path.join(d, f), encoding="utf-8")))
-            return [(r[1] + " . " + r[2], int(r[0]) - 1) for r in rows]
-        return rd("agnews_train.csv"), rd("agnews_test.csv"), 4
-    if name == "sst2":
-        def rd(f):
-            out = []
-            for line in open(os.path.join(d, f), encoding="utf-8"):
-                t, _, y = line.rstrip("\n").rpartition("\t")
-                out.append((t, int(y)))
-            return out
-        return rd("sst2_train.tsv"), rd("sst2_test.tsv"), 2
-    raise ValueError(name)
+class Reveal(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    fact_id: str = Field(min_length=1, max_length=40)
 
 
-class Vocab:
-    def __init__(self, texts, n_classes):
-        c = Counter(w for t in texts for w in tokenize(t))
-        words = [w for w, _ in c.most_common(VOCAB)]
-        self.n_classes = n_classes
-        # label tokens sit right after the special tokens; the template words "the label is" are ordinary words
-        self.label0 = NSPECIAL
-        self.itos = words
-        self.w2i = {w: NSPECIAL + n_classes + i for i, w in enumerate(words)}
-        self.size = NSPECIAL + n_classes + len(words)
-        self.tmpl = [self.w2i.get(w, UNK) for w in ["the", "label", "is"]]
-
-    def encode(self, text):
-        return [self.w2i.get(w, UNK) for w in tokenize(text)][:MAXLEN]
+class ModelComparison(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    model_id: str = Field(min_length=1, max_length=150)
+    framework_id: Literal["utility", "duty", "fairness"]
+    evidence_step: int = Field(ge=0, le=4)
+    repeat: bool = False
+    allow_paid_jev: bool = False
 
 
-def pad(seqs, extra=0):
-    L = max(len(s) for s in seqs) + extra
-    x = torch.full((len(seqs), L), PAD, dtype=torch.long)
-    for i, s in enumerate(seqs):
-        x[i, :len(s)] = torch.tensor(s)
-    return x
+def now():
+    return datetime.now(timezone.utc).isoformat()
 
 
-# ---------------------------------------------------------------------------------------- backbone
-class Backbone(nn.Module):
-    def __init__(self, vocab, layers, causal):
-        super().__init__()
-        self.causal = causal
-        self.emb = nn.Embedding(vocab, D_MODEL, padding_idx=PAD)
-        self.pos = nn.Embedding(MAXLEN + 8, D_MODEL)
-        layer = nn.TransformerEncoderLayer(D_MODEL, N_HEADS, 4 * D_MODEL, dropout=0.1,
-                                           batch_first=True, norm_first=True)
-        self.enc = nn.TransformerEncoder(layer, layers, enable_nested_tensor=False)
-        self.norm = nn.LayerNorm(D_MODEL)
+def load_run(run_id):
+    run = store.get(run_id)
+    if not run:
+        raise HTTPException(404, "This run was not found. Start a new investigation.")
+    return run
 
-    def forward(self, x):
-        T = x.shape[1]
-        h = self.emb(x) + self.pos(torch.arange(T, device=x.device))[None]
-        if self.causal:
-            m = torch.triu(torch.ones(T, T, dtype=torch.bool), 1)
-            h = self.enc(h, mask=m)           # right padding never leaks into earlier positions
+
+def public_run(run):
+    if run["version"] != VERSION:
+        raise HTTPException(409, "This run uses a different rule version. Its journal is preserved; start a new run with the current engine.")
+    scenario = run.get("scenario", get_scenario(run["scenario_id"]))
+    observed = run["observed"]
+    remaining = 0 if run["finished"] else 2 - spent_credits(scenario, observed)
+    response = {"id": run["id"], "created_at": run["created_at"], "version": run["version"], "mode": "reference",
+                "scenario": scenario, "observed": observed, "finished": run["finished"], "remaining": remaining,
+                "spent": spent_credits(scenario, observed), "budget": 2, "facts": fact_cards(scenario, observed), "events": run["events"],
+                "agents": engine.agents(scenario, observed, remaining), "analysis": engine.analyze(scenario, observed)}
+    if run["finished"]:
+        response["debrief"] = {"facts": fact_cards(scenario, run["actual"]),
+                               "agents": engine.agents(scenario, run["actual"], 0),
+                               "analysis": engine.analyze(scenario, run["actual"])}
+    return response
+
+
+@app.get("/")
+def index():
+    return FileResponse(STATIC / "index.html")
+
+
+@app.get("/decision")
+def decision_page():
+    return FileResponse(STATIC / "decision.html")
+
+
+@app.get("/api/catalog")
+def catalog():
+    return {"scenarios": SCENARIOS, "frameworks": FRAMEWORKS, "actions": ACTIONS, "version": VERSION}
+
+
+@app.post("/api/runs", status_code=201)
+def create_run(body: NewRun):
+    if not get_scenario(body.scenario_id):
+        raise HTTPException(404, "Unknown scenario.")
+    run = {"id": str(uuid4()), "scenario_id": body.scenario_id, "scenario": get_scenario(body.scenario_id), "created_at": now(), "version": VERSION,
+           "actual": {key: bool(secrets.randbits(1)) for key in fact_ids(get_scenario(body.scenario_id))}, "observed": {}, "events": [], "finished": False}
+    store.save_new(run)
+    return public_run(run)
+
+
+@app.get("/api/runs/{run_id}")
+def read_run(run_id: str):
+    return public_run(load_run(run_id))
+
+
+@app.post("/api/runs/{run_id}/reveal")
+def reveal(run_id: str, body: Reveal):
+    def operation(run):
+        if run["version"] != VERSION:
+            raise HTTPException(409, "This run belongs to a different rule version. Start a new run.")
+        scenario = run.get("scenario", get_scenario(run["scenario_id"]))
+        fact = next((f for f in facts_for(scenario) if f["id"] == body.fact_id), None)
+        if not fact:
+            raise HTTPException(422, "This fact does not belong to this case.")
+        remaining = 2 - spent_credits(scenario, run["observed"])
+        if run["finished"] or fact["cost"] > remaining:
+            raise HTTPException(409, "This fact exceeds the remaining credits, or the round is closed.")
+        if body.fact_id in run["observed"]:
+            raise HTTPException(409, "This fact has already been revealed.")
+        agents_before = engine.agents(scenario, run["observed"], remaining)
+        suggestions = {agent["id"]: agent["next_question"] for agent in agents_before}
+        plans = {agent["id"]: agent["optimal_plan"] for agent in agents_before}
+        value = run["actual"][body.fact_id]
+        run["observed"][body.fact_id] = value
+        run["events"].append({"type": "reveal", "at": now(), "fact_id": body.fact_id, "value": value,
+                              "cost": fact["cost"], "recommendations_before": suggestions, "optimal_recommendations_before": plans,
+                              "actions_after": {a["id"]: a["robust_actions"] for a in engine.agents(scenario, run["observed"], 0)}})
+    run = store.update(run_id, operation)
+    if not run:
+        raise HTTPException(404, "Run not found.")
+    return public_run(run)
+
+
+@app.get("/api/runs/{run_id}/replay")
+def replay(run_id: str):
+    recorded = load_run(run_id)
+    public_run(recorded)  # Enforce the same version guard as the live view.
+    snapshot = deepcopy(recorded)
+    snapshot.update(observed={}, events=[], finished=False)
+    frames = [{"label": "Before any disclosure", "kind": "start", "state": deepcopy(public_run(snapshot))}]
+    for event in recorded["events"]:
+        snapshot["events"].append(deepcopy(event))
+        if event["type"] == "reveal":
+            snapshot["observed"][event["fact_id"]] = event["value"]
+            label = fact_value(snapshot["scenario"], event["fact_id"], event["value"])
         else:
-            h = self.enc(h, src_key_padding_mask=(x == PAD))
-        return self.norm(h)
+            snapshot["finished"] = True
+            label = "Full-information debrief"
+        frames.append({"label": label, "kind": event["type"], "fact_id": event.get("fact_id"),
+                       "state": deepcopy(public_run(snapshot))})
+    return {"run_id": run_id, "frames": frames}
 
 
-class Model(nn.Module):
-    def __init__(self, kind, vocab, n_classes, layers):
-        super().__init__()
-        self.kind, self.K = kind, n_classes
-        self.body = Backbone(vocab.size, layers, causal=kind in ("AR", "AR_pseudo"))
-        self.vocab = vocab
-        if kind == "ENC":
-            self.head = nn.Linear(D_MODEL, n_classes)
-        else:
-            self.head = nn.Linear(D_MODEL, vocab.size)
-
-    # ---- building inputs
-    def build(self, texts_ids, labels=None):
-        v = self.vocab
-        if self.kind == "ENC":
-            return pad([[CLS] + t for t in texts_ids])
-        if self.kind == "MLM":   # [CLS] text [SEP] the label is [LABEL]
-            return pad([[CLS] + t + [SEP] + v.tmpl + [v.label0 + (y if labels is not None else 0)]
-                        for t, y in zip(texts_ids, labels if labels is not None else [0] * len(texts_ids))])
-        if self.kind == "AR_pseudo":   # [BOS] text [LABEL]
-            return pad([[BOS] + t + [v.label0 + y] for t, y in zip(texts_ids, labels)])
-        if self.kind == "AR":          # [BOS] [LABEL] text
-            return pad([[BOS, v.label0 + y] + t for t, y in zip(texts_ids, labels)])
-
-    # ---- training loss
-    def loss(self, texts_ids, labels):
-        v = self.vocab
-        y = torch.tensor(labels)
-        if self.kind == "ENC":
-            h = self.body(self.build(texts_ids))[:, 0]
-            return F.cross_entropy(self.head(h), y)
-        x = self.build(texts_ids, labels)
-        if self.kind == "MLM":
-            tgt = x.clone()
-            lens = (x != PAD).sum(1)
-            inp = x.clone()
-            sel = (torch.rand(x.shape) < 0.15) & (x != PAD) & (x != CLS) & (x != SEP)
-            lab_pos = lens - 1
-            sel[torch.arange(len(x)), lab_pos] = True          # the label slot is always masked
-            inp[sel] = MASK
-            h = self.body(inp)
-            logits = self.head(h[sel])
-            return F.cross_entropy(logits, tgt[sel])
-        h = self.body(x[:, :-1])                                   # causal LM, next-token loss on every token
-        logits = self.head(h)
-        tgt = x[:, 1:]
-        return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), tgt.reshape(-1), ignore_index=PAD)
-
-    # ---- inference: returns (N, K) scores (log-probabilities up to a constant)
-    @torch.no_grad()
-    def scores(self, texts_ids):
-        v = self.vocab
-        n = len(texts_ids)
-        if self.kind == "ENC":
-            return F.log_softmax(self.head(self.body(self.build(texts_ids))[:, 0]), -1)
-        if self.kind == "MLM":
-            x = self.build(texts_ids, [0] * n)
-            lens = (x != PAD).sum(1)
-            x[torch.arange(n), lens - 1] = MASK
-            h = self.body(x)[torch.arange(n), lens - 1]
-            lg = self.head(h)[:, v.label0:v.label0 + self.K]
-            return F.log_softmax(lg, -1)
-        if self.kind == "AR_pseudo":
-            x = pad([[BOS] + t for t in texts_ids])
-            lens = torch.tensor([len(t) + 1 for t in texts_ids])
-            h = self.body(x)[torch.arange(n), lens - 1]
-            return F.log_softmax(self.head(h)[:, v.label0:v.label0 + self.K], -1)
-        # AR: log P(x | y) for every candidate label, then softmax over labels (uniform prior)
-        out = []
-        for y in range(self.K):
-            x = self.build(texts_ids, [y] * n)
-            lg = F.log_softmax(self.head(self.body(x[:, :-1])), -1)
-            tgt = x[:, 2:]                                      # skip predicting the label itself
-            lp = lg[:, 1:].gather(-1, tgt[..., None])[..., 0]
-            lp = (lp * (tgt != PAD)).sum(1)
-            out.append(lp)
-        return F.log_softmax(torch.stack(out, 1), -1)
+@app.post("/api/runs/{run_id}/finish")
+def finish(run_id: str):
+    def operation(run):
+        if run["version"] != VERSION:
+            raise HTTPException(409, "This run belongs to a different rule version. Start a new run.")
+        if not run["finished"]:
+            run["finished"] = True
+            run["events"].append({"type": "finish", "at": now()})
+    run = store.update(run_id, operation)
+    if not run:
+        raise HTTPException(404, "Run not found.")
+    return public_run(run)
 
 
-# ------------------------------------------------------------------------------------------ metrics
-def ece(probs, y, bins=10):
-    conf, pred = probs.max(1)
-    acc = (pred == y).float()
-    e = 0.0
-    edges = torch.linspace(0, 1, bins + 1)
-    for lo, hi in zip(edges[:-1], edges[1:]):
-        m = (conf > lo) & (conf <= hi)
-        if m.any():
-            e += m.float().mean() * (acc[m].mean() - conf[m].mean()).abs()
-    return float(e)
+@app.get("/api/benchmark")
+def benchmark():
+    return {"version": VERSION, **engine.benchmark(SCENARIOS)}
 
 
-def evaluate(model, X, Y, bs=256):
-    model.eval()
-    S = torch.cat([model.scores(X[i:i + bs]) for i in range(0, len(X), bs)])
-    pred = S.argmax(1).numpy()
-    p = S.exp()
-    return {"wf1": float(f1_score(Y, pred, average="weighted")), "acc": float((pred == np.array(Y)).mean()),
-            "ece": ece(p, torch.tensor(Y))}
+@app.get("/api/models")
+def model_catalog(refresh: bool = False):
+    return openrouter.model_catalog(refresh)
 
 
-def corrupt(X, rate, vocab, rng, mode):
-    out = []
-    for t in X:
-        if mode == "drop":
-            k = [w for w in t if rng.random() > rate] or t[:1]
-        else:
-            k = [rng.randrange(NSPECIAL + vocab.n_classes, vocab.size) if rng.random() < rate else w for w in t]
-        out.append(k)
-    return out
+@app.get("/api/openrouter/status")
+def model_connection(check_quota: bool = False):
+    return openrouter.connection_status(check_quota)
 
 
-# ------------------------------------------------------------------------------------------- driver
-EPOCHS = {128: 40, 512: 25, 2048: 12}
+@app.get("/api/runs/{run_id}/comparisons")
+def model_history(run_id: str):
+    run = load_run(run_id)
+    public_run(run)
+    return {"state_key": comparisons.state_key(run), "records": comparisons.history(run_id)}
 
 
-def run_one(ds, kind, layers, n, seed, vocab, train_pool, val, test, K, args):
-    import random
-    torch.manual_seed(seed)
-    rng = random.Random(seed)
-    idx = list(range(len(train_pool)))
-    random.Random(seed).shuffle(idx)
-    sub = [train_pool[i] for i in idx[:n]]
-    X = [vocab.encode(t) for t, _ in sub]
-    Y = [y for _, y in sub]
-    Xv = [vocab.encode(t) for t, _ in val]
-    Yv = [y for _, y in val]
-    model = Model(kind, vocab, K, layers)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    ep = EPOCHS.get(n, 9)
-    bs = 32
-    total = ep * math.ceil(n / bs)
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=total, pct_start=0.1)
-    best, best_state, step = -1, None, 0
-    for e in range(ep):
-        model.train()
-        order = list(range(n))
-        rng.shuffle(order)
-        for i in range(0, n, bs):
-            b = order[i:i + bs]
-            loss = model.loss([X[j] for j in b], [Y[j] for j in b])
-            opt.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            sched.step()
-        if e % max(1, ep // 4) == 0 or e == ep - 1:           # model selection on a fixed held-out validation set
-            f = evaluate(model, Xv, Yv)["wf1"]
-            if f > best:
-                best, best_state = f, {k: v.clone() for k, v in model.state_dict().items()}
-    model.load_state_dict(best_state)
-    Xt = [vocab.encode(t) for t, _ in test]
-    Yt = [y for _, y in test]
-    res = evaluate(model, Xt, Yt)
-    res["val_wf1"] = best
-    # clean F1 on the SAME 500 examples that the noise runs use, so that noisy vs clean is a like-for-like
-    # comparison (before this fix the relative drop divided a 500-example noisy F1 by a 1,000-example clean F1)
-    res["wf1_500"] = evaluate(model, Xt[:500], Yt[:500])["wf1"]
-    r2 = random.Random(1000 + seed)
-    for mode in ("drop", "sub"):
-        res[f"{mode}30"] = evaluate(model, corrupt(Xt[:500], 0.30, vocab, r2, mode), Yt[:500])["wf1"]
-    return res
+@app.post("/api/runs/{run_id}/comparisons")
+def compare_model(run_id: str, body: ModelComparison):
+    run = load_run(run_id)
+    public_run(run)
+    if body.evidence_step != len(run["events"]):
+        raise HTTPException(409, "The evidence changed. Refresh the comparison before running models.")
+    configured = next((m for m in openrouter.MODELS if m["id"] == body.model_id), None)
+    if not openrouter.allowed_model(body.model_id):
+        raise HTTPException(422, "Select a configured comparison model.")
+    if configured and configured["kind"] == "decision" and not body.allow_paid_jev:
+        raise HTTPException(400, "Jev is paid. Select its explicitly labeled paid option before running.")
+    return comparisons.execute(run, body.model_id, body.framework_id, body.repeat, body.allow_paid_jev)
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", required=True)
-    ap.add_argument("--layers", type=int, nargs="+", default=[1, 4])
-    ap.add_argument("--sizes", type=int, nargs="+", default=[128, 512, 2048])
-    ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1])
-    ap.add_argument("--models", nargs="+", default=["ENC", "MLM", "AR", "AR_pseudo"])
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--ntest", type=int, default=1000)
-    ap.add_argument("--out", default=None)
-    args = ap.parse_args()
-    torch.set_num_threads(1)
-
-    train, test, K = load_dataset(args.dataset)
-    import random
-    random.Random(123).shuffle(train)
-    random.Random(124).shuffle(test)
-    test = test[:args.ntest]
-    val, pool = train[:200], train[200:]
-    vocab = Vocab([t for t, _ in pool], K)
-    os.makedirs(os.path.join(HERE, "results"), exist_ok=True)
-    out = args.out or os.path.join(HERE, "results", f"{args.dataset}.jsonl")
-    done = set()
-    if os.path.exists(out):
-        for line in open(out):
-            r = json.loads(line)
-            done.add((r["model"], r["layers"], r["n"], r["seed"]))
-    for n in args.sizes:
-        for L in args.layers:
-            for kind in args.models:
-                for seed in args.seeds:
-                    if (kind, L, n, seed) in done:
-                        continue
-                    t0 = time.time()
-                    r = run_one(args.dataset, kind, L, n, seed, vocab, pool, val, test, K, args)
-                    r.update(dataset=args.dataset, model=kind, layers=L, n=n, seed=seed, secs=round(time.time() - t0, 1))
-                    with open(out, "a") as f:
-                        f.write(json.dumps(r) + "\n")
-                    print(f"{args.dataset} L={L} n={n:5d} {kind:9s} seed={seed} wF1={r['wf1']:.3f} "
-                          f"ECE={r['ece']:.3f} drop30={r['drop30']:.3f} sub30={r['sub30']:.3f} ({r['secs']}s)", flush=True)
+@app.get("/api/runs/{run_id}/comparisons/export")
+def export_comparisons(run_id: str, format: Literal["md", "json"] = "md"):
+    run = load_run(run_id)
+    public_run(run)
+    records = comparisons.history(run_id)
+    if format == "json":
+        return {"run_id": run_id, "records": records}
+    return PlainTextResponse(comparisons.markdown(run, records), media_type="text/markdown",
+                             headers={"Content-Disposition": f'attachment; filename="model-comparisons-{run_id[:8]}.md"'})
 
 
-if __name__ == "__main__":
-    main()
+@app.get("/api/runs/{run_id}/export")
+def export_run(run_id: str, format: Literal["md", "json"] = "md"):
+    run = load_run(run_id)
+    view = public_run(run)
+    if format == "json":
+        return view
+    scenario = view["scenario"]
+    lines = ["# Before You Decide - experiment record", "", f"- Run: `{run['id']}`", f"- Created: {run['created_at']}",
+             f"- Reference engine: {VERSION}", "- Prior: independent binary facts, eight equally weighted worlds.",
+             "- Shared disclosure budget: 2 credits. Counterfactual counts are not calibrated confidence.",
+             f"- Status: {'Debrief opened' if run['finished'] else 'Investigation'}", "",
+             f"## {scenario['title']}", "", scenario["description"], "",
+             f"Main group: {scenario['main']}; side group: {scenario['side']}; diversion side risk: {scenario['side_risk']:.0%}; brake risk per person: {scenario['brake_risk']:.0%}.",
+             f"Possible rescue probabilities: {scenario['low']:.0%} and {scenario['high']:.0%}.",
+             scenario.get("model_note", "The hidden causal-role and brake facts determine the duty constraint and brake availability."),
+             f"Credits spent: {view['spent']}/2.",
+             "", "## Disclosure timeline", ""]
+    for event in run["events"]:
+        if event["type"] == "reveal":
+            lines.append(f"- {event['at']}: {event['fact_id']} - {fact_value(scenario, event['fact_id'], event['value'])} ({event['cost']} credits).")
+            for framework in FRAMEWORKS:
+                suggestion = event["recommendations_before"][framework["id"]]
+                detail = f"{suggestion['fact_id']} ({suggestion['gain']:.3f} bits)" if suggestion else "No further informative question requested"
+                lines.append(f"  - {framework['name']} greedy recommendation: {detail}.")
+                plan = event["optimal_recommendations_before"][framework["id"]]
+                lines.append(f"  - Budget planner: {plan['fact_id'] or 'Stop'}, {plan['resolved_probability']:.0%} chance of resolution, {plan['expected_cost']:.2f} expected credits.")
+    if not run["observed"]:
+        lines.append("No facts were disclosed during the investigation.")
+    lines.extend(["", "## Decisions at the disclosure budget", ""])
+    for agent in view["agents"]:
+        lines.extend([f"### {agent['name']}", "", agent["rule"], "", agent["reason"], ""])
+        lines.extend(f"- {ACTIONS[action]}: supported in {count}/{agent['world_count']} remaining worlds." for action, count in agent["support"].items() if count)
+        lines.append("")
+    lines.extend(["## Disagreement analysis", "", view["analysis"]["title"], "", view["analysis"]["description"], ""])
+    if "debrief" in view:
+        lines.extend(["## Full-information debrief (outside the question budget)", ""])
+        lines.extend(f"- {fact['title']}: {fact['value']}" for fact in view["debrief"]["facts"])
+        lines.append("")
+        lines.extend(f"- {agent['name']}: {', '.join(ACTIONS[a] for a in agent['robust_actions'])}" for agent in view["debrief"]["agents"])
+    lines.extend(["", "## Limits", "", "This is an authored reference-policy simulation, not an LLM experiment. The policies are simplified operational definitions, not complete philosophical theories. Disagreement is not a measure of moral error. Unrevealed actual values are excluded from unfinished-run exports.", ""])
+    return PlainTextResponse("\n".join(lines), media_type="text/markdown", headers={"Content-Disposition": f'attachment; filename="before-you-decide-{run_id[:8]}.md"'})
